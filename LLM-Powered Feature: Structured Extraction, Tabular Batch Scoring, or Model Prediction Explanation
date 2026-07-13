@@ -1,0 +1,363 @@
+# Part 4: Tabular Record Batch Scoring
+# Track B: LLM-Powered Batch Scoring with Structured Output
+
+import os
+import re
+import json
+import requests
+import jsonschema
+from jsonschema import validate, ValidationError
+
+# =============================================================================
+# 1. API CONNECTION SETUP
+# =============================================================================
+
+def call_llm(system_prompt, user_prompt, temperature=0.0, max_tokens=512):
+    """
+    Reusable function to call an LLM API.
+    
+    Args:
+        system_prompt: The system-level instructions for the LLM
+        user_prompt: The user input/query
+        temperature: Sampling temperature (0.0 = deterministic)
+        max_tokens: Maximum tokens in response
+    
+    Returns:
+        The LLM's response content, or None if the call fails
+    """
+    api_key = os.environ.get('LLM_API_KEY')
+    if not api_key:
+        print("Error: LLM_API_KEY environment variable not set")
+        return None
+    
+    url = "[openrouter.ai](https://openrouter.ai/api/v1/chat/completions)"
+    
+    payload = {
+        "model": "openai/gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            print(f"API Error: Status code {response.status_code}")
+            print(f"Response: {response.text}")
+            return None
+        return response.json()['choices'][0]['message']['content']
+    except Exception as e:
+        print(f"Request failed: {e}")
+        return None
+
+# Test the connection
+print("Testing LLM connection...")
+test_response = call_llm(
+    system_prompt="You are a helpful assistant.",
+    user_prompt="Reply with only the word: hello"
+)
+print(f"Test response: {test_response}")
+
+# =============================================================================
+# 2. PII GUARDRAIL
+# =============================================================================
+
+def has_pii(text):
+    """
+    Check if text contains personally identifiable information.
+    Detects email addresses and phone numbers.
+    
+    Args:
+        text: Input string to check
+    
+    Returns:
+        True if PII is detected, False otherwise
+    """
+    email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+    phone_pattern = r'\b\d{10}\b|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b'
+    return bool(re.search(email_pattern, text) or re.search(phone_pattern, text))
+
+# Demonstrate guardrail
+print("\n" + "="*60)
+print("GUARDRAIL DEMONSTRATION")
+print("="*60)
+
+# Test 1: Input with email (should be blocked)
+test_input_with_pii = '{"customer_id": "C001", "email": "john.doe@example.com", "amount": 500}'
+print(f"\nTest 1 - Input with email: {test_input_with_pii}")
+if has_pii(test_input_with_pii):
+    print("Input blocked: PII detected.")
+else:
+    print("Input passed guardrail check")
+
+# Test 2: Clean input (should pass)
+test_input_clean = '{"customer_id": "C001", "transaction_amount": 500, "category": "electronics"}'
+print(f"\nTest 2 - Clean input: {test_input_clean}")
+if has_pii(test_input_clean):
+    print("Input blocked: PII detected.")
+else:
+    print("Input passed guardrail check - proceeding to LLM call")
+
+# =============================================================================
+# 3. SCHEMA DEFINITION
+# =============================================================================
+
+# JSON Schema for batch scoring output (5 required scalar fields)
+SCORING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "risk_tier": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+        },
+        "flag_for_review": {
+            "type": "boolean"
+        },
+        "primary_signal": {
+            "type": "string"
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+        },
+        "recommended_action": {
+            "type": "string"
+        }
+    },
+    "required": ["risk_tier", "flag_for_review", "primary_signal", "confidence", "recommended_action"]
+}
+
+# =============================================================================
+# 4. PROMPT DESIGN
+# =============================================================================
+
+# System prompt with rubric and one worked example (few-shot)
+SYSTEM_PROMPT = """You are a transaction risk assessment specialist. Your task is to analyze transaction records and provide structured risk assessments.
+
+SCORING RUBRIC:
+1. risk_tier: Assess overall risk level
+   - "high": Transaction amount > $1000 OR category is "gambling" or "crypto" OR multiple risk signals present
+   - "medium": Transaction amount $500-$1000 OR unusual time patterns OR single risk signal
+   - "low": Transaction amount < $500 AND standard category AND no risk signals
+
+2. flag_for_review: Boolean indicating if human review is needed
+   - true: Any high-risk tier OR confidence is "low" OR unusual patterns detected
+   - false: Low/medium risk with high confidence
+
+3. primary_signal: The most important factor in your assessment (string description)
+
+4. confidence: Your confidence in the assessment
+   - "high": Clear-cut case with consistent signals
+   - "medium": Some ambiguity but reasonable certainty
+   - "low": Conflicting signals or insufficient data
+
+5. recommended_action: Specific next step (e.g., "approve", "hold for review", "escalate to fraud team")
+
+WORKED EXAMPLE:
+Input: {"transaction_id": "T999", "amount": 2500, "category": "electronics", "time": "03:45", "customer_tenure_days": 15, "previous_transactions": 2}
+
+Output: {"risk_tier": "high", "flag_for_review": true, "primary_signal": "High transaction amount ($2500) combined with new customer (15 days tenure) and unusual transaction time (03:45)", "confidence": "high", "recommended_action": "escalate to fraud team"}
+
+OUTPUT RULES:
+- Respond with ONLY valid JSON, no additional text
+- Include all 5 required fields
+- Use exact field names and allowed values as specified"""
+
+USER_PROMPT_TEMPLATE = """Analyze this transaction record and provide a risk assessment:
+
+{record_json}
+
+Respond with only the JSON assessment."""
+
+# =============================================================================
+# 5. VALIDATION FUNCTION
+# =============================================================================
+
+def validate_llm_response(response_text):
+    """
+    Parse and validate LLM response against the scoring schema.
+    
+    Args:
+        response_text: Raw string response from LLM
+    
+    Returns:
+        Tuple of (parsed_dict, validation_status, error_message)
+    """
+    if response_text is None:
+        return get_fallback_dict(), "fail", "No response from LLM"
+    
+    # Strip whitespace
+    cleaned = response_text.strip()
+    
+    # Try to parse JSON
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print(f"JSON Parse Error: {e}")
+        return get_fallback_dict(), "fail", f"JSONDecodeError: {e}"
+    
+    # Validate against schema
+    try:
+        validate(instance=parsed, schema=SCORING_SCHEMA)
+        return parsed, "pass", None
+    except ValidationError as e:
+        print(f"Validation Error: {e.message}")
+        return get_fallback_dict(), "fail", f"ValidationError: {e.message}"
+
+def get_fallback_dict():
+    """Return fallback dict with all required fields set to null."""
+    return {
+        "risk_tier": None,
+        "flag_for_review": None,
+        "primary_signal": None,
+        "confidence": None,
+        "recommended_action": None
+    }
+
+# =============================================================================
+# 6. SAMPLE RECORDS FROM DATASET
+# =============================================================================
+
+# Three sample records (replace with actual records from your cleaned dataset)
+sample_records = [
+    {
+        "transaction_id": "T001",
+        "amount": 150,
+        "category": "groceries",
+        "time": "14:30",
+        "customer_tenure_days": 730,
+        "previous_transactions": 245
+    },
+    {
+        "transaction_id": "T002",
+        "amount": 850,
+        "category": "electronics",
+        "time": "02:15",
+        "customer_tenure_days": 45,
+        "previous_transactions": 8
+    },
+    {
+        "transaction_id": "T003",
+        "amount": 3200,
+        "category": "crypto",
+        "time": "23:55",
+        "customer_tenure_days": 5,
+        "previous_transactions": 1
+    }
+]
+
+# =============================================================================
+# 7. BATCH SCORING PIPELINE
+# =============================================================================
+
+def score_record(record, temperature=0.0):
+    """
+    Score a single record using the LLM.
+    
+    Args:
+        record: Dictionary containing transaction data
+        temperature: LLM sampling temperature
+    
+    Returns:
+        Tuple of (record, raw_response, validated_result, status)
+    """
+    record_json = json.dumps(record, indent=2)
+    user_prompt = USER_PROMPT_TEMPLATE.format(record_json=record_json)
+    
+    # Check for PII before calling LLM
+    if has_pii(record_json):
+        print("Input blocked: PII detected.")
+        return record, None, get_fallback_dict(), "blocked"
+    
+    # Call LLM
+    raw_response = call_llm(
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        temperature=temperature
+    )
+    
+    # Validate response
+    validated, status, error = validate_llm_response(raw_response)
+    
+    return record, raw_response, validated, status
+
+print("\n" + "="*60)
+print("BATCH SCORING - TEMPERATURE 0.0")
+print("="*60)
+
+results_temp0 = []
+for i, record in enumerate(sample_records, 1):
+    print(f"\n--- Record {i} ---")
+    print(f"Input: {json.dumps(record)}")
+    
+    record_data, raw, validated, status = score_record(record, temperature=0.0)
+    results_temp0.append({
+        "input": record_data,
+        "raw_response": raw,
+        "validated": validated,
+        "status": status
+    })
+    
+    print(f"Raw LLM Response: {raw}")
+    print(f"Validated Result: {json.dumps(validated, indent=2)}")
+    print(f"Validation Status: {status}")
+
+# =============================================================================
+# 8. TEMPERATURE A/B COMPARISON
+# =============================================================================
+
+print("\n" + "="*60)
+print("TEMPERATURE A/B COMPARISON")
+print("="*60)
+
+comparison_results = []
+
+for i, record in enumerate(sample_records, 1):
+    print(f"\n--- Record {i} Comparison ---")
+    
+    # Temperature 0.0
+    _, raw_t0, validated_t0, status_t0 = score_record(record, temperature=0.0)
+    
+    # Temperature 0.7
+    _, raw_t7, validated_t7, status_t7 = score_record(record, temperature=0.7)
+    
+    comparison_results.append({
+        "input": record,
+        "output_temp_0": raw_t0,
+        "output_temp_07": raw_t7
+    })
+    
+    print(f"Input: {json.dumps(record)}")
+    print(f"Output (temp=0.0): {raw_t0}")
+    print(f"Output (temp=0.7): {raw_t7}")
+
+# =============================================================================
+# 9. SUMMARY TABLES
+# =============================================================================
+
+print("\n" + "="*60)
+print("BATCH SCORING RESULTS TABLE")
+print("="*60)
+print(f"{'Record':<10} | {'Risk Tier':<10} | {'Review?':<8} | {'Confidence':<10} | {'Status':<8}")
+print("-" * 60)
+
+for i, result in enumerate(results_temp0, 1):
+    v = result['validated']
+    print(f"Record {i:<3} | {str(v.get('risk_tier', 'N/A')):<10} | {str(v.get('flag_for_review', 'N/A')):<8} | {str(v.get('confidence', 'N/A')):<10} | {result['status']:<8}")
+
+print("\n" + "="*60)
+print("TEMPERATURE COMPARISON TABLE")
+print("="*60)
+
+for i, comp in enumerate(comparison_results, 1):
+    print(f"\nRecord {i}:")
+    print(f"  Temp 0.0: {comp['output_temp_0'][:100]}..." if comp['output_temp_0'] and len(comp['output_temp_0']) > 100 else f"  Temp 0.0: {comp['output_temp_0']}")
+    print(f"  Temp 0.7: {comp['output_temp_07'][:100]}..." if comp['output_temp_07'] and len(comp['output_temp_07']) > 100 else f"  Temp 0.7: {comp['output_temp_07']}")
