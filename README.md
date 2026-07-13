@@ -343,17 +343,3 @@ Through this capstone project, I gained practical experience in:
 - Real-time Prediction API
 
 ---
-
-# Author
-
-**Mani Bharathi B**
-
-Software Engineer | AI & Machine Learning Enthusiast
-
-GitHub: https://github.com/bmanibharathibe
-
----
-
-# License
-
-This project was developed for educational purposes as part of the Applied AI & ML Essentials Capstone Project. It demonstrates the implementation of a complete machine learning workflow using Python and popular open-source libraries.
